@@ -126,7 +126,14 @@ def mistral_flash_attn2_forward(
         cache_kwargs = {"sin": sin, "cos": cos}  # Specific to RoPE models
         if key_states.shape[-2] >= kv_seq_len: # [SnapKV] add kv_cluster
             self.kv_seq_len = kv_seq_len
-            key_states_compress, value_states_compress = self.kv_cluster.update_kv(key_states, query_states, value_states, attention_mask, self.num_key_value_groups)
+            coord = getattr(self, "ilf", None)  # [ILF] set by snapkv.monkeypatch.ilf.attach_ilf
+            if coord is not None and q_len >= self.kv_cluster.max_capacity_prompt:
+                # [ILF] record this layer's scores and store the full KV; every layer is
+                # compressed together after the last layer (see ILFCoordinator.finalize)
+                coord.record(self.layer_idx, self.kv_cluster.score(key_states, query_states))
+                key_states_compress, value_states_compress = key_states, value_states
+            else:
+                key_states_compress, value_states_compress = self.kv_cluster.update_kv(key_states, query_states, value_states, attention_mask, self.num_key_value_groups)
             past_key_value.update(key_states_compress, value_states_compress, self.layer_idx, cache_kwargs)
         else:
             self.kv_seq_len += q_len
