@@ -27,6 +27,14 @@ Commands (run with the Python 3.10 environment):
   python scripts/eval_reuse.py run --task niah --methods int8 int4 int2 mixed-4-2 snapkv+int2 --budgets 0.5
   python scripts/eval_reuse.py summarize --task haystack
 
+Probe methods (probe-details, probe-repeat, probe-custom with --probe_text, probe-question) score
+SnapKV with a probe window instead of the document's last 32 tokens: a short generic instruction is
+appended after the document only for compression, used as SnapKV's observation window, then removed
+from the cache. probe-question uses each actual question as the probe (one compression per question):
+an oracle upper bound. `summarize` reports gap_closed = share of the SnapKV -> oracle gap recovered.
+  python scripts/eval_reuse.py run --task niah --methods snapkv probe-details probe-repeat probe-question \
+         --budgets 0.1 0.3 0.5 0.7 --n_docs 30
+
 Quantization (int8 / int4 / int2 / mixed-A-B, alone or after eviction as "snapkv+int2") is simulated:
 each layer's cache is quantized and dequantized right after compression (snapkv/monkeypatch/quant.py),
 so accuracy is exact while `mem_frac` (cache memory as a fraction of fp16) is computed analytically,
@@ -52,6 +60,13 @@ TASKS = ["niah", "haystack", "ruler_mk"]
 NIAH_REPO = "https://github.com/gkamradt/LLMTest_NeedleInAHaystack.git"
 DEFAULT_ESSAYS = "/content/LLMTest_NeedleInAHaystack/needlehaystack/PaulGrahamEssays"
 NIAH_INSTRUCTION = "Don't give information outside the document or repeat your findings"
+# Probes: generic instructions used ONLY as SnapKV's observation window when compressing a document
+# before any question is known; they are removed from the cache afterwards (see compress()).
+PROBES = {
+    "probe-details": "Read the text above carefully and remember every specific detail it contains.",
+    "probe-repeat": "Repeat the text above.",
+}
+PROBE_METHODS = [*PROBES, "probe-custom", "probe-question"]
 
 NAMES = ["Alice", "Bruno", "Chiara", "Dmitri", "Esme", "Farid", "Greta", "Hiro", "Ines", "Jonas",
          "Kemal", "Lena", "Mateo", "Nadia", "Oskar", "Priya", "Quentin", "Rosa", "Sven", "Tariq",
@@ -232,6 +247,11 @@ def encode_suffix(tok, q, with_answer=True):
     return ids, n
 
 
+def encode_probe(tok, text):
+    """A probe is formatted like a question: "\n\n<text> [/INST]"."""
+    return tok("\n\n" + text + " [/INST]", add_special_tokens=False).input_ids
+
+
 # --------------------------------------------------------------------------------------------
 # Methods
 # --------------------------------------------------------------------------------------------
@@ -241,10 +261,11 @@ def parse_layers(spec):
 
 
 def method_arms(methods, lams, mid):
-    """[(label, evicts, attach_ilf kwargs or None, quantization spec or None)].
+    """[(label, evicts, attach_ilf kwargs or None, quantization spec or None, probe or None)].
 
     A method is an eviction rule, a quantization, or both joined by '+':
       full | snapkv | ilf-all | ilf-mid | ilf-except-mid | ilf-mid-band | random-mid
+      probe-details | probe-repeat | probe-custom | probe-question   (SnapKV scored by a probe window)
       int8 | int4 | int2 | mixed-A-B   (A bits in the --mid layers, B elsewhere; full cache)
       snapkv+int2, ilf-mid+mixed-4-2, ...   (evict to the budget, then quantize what is kept)
     """
@@ -256,17 +277,19 @@ def method_arms(methods, lams, mid):
         suffix = f"+{q}" if q and base != FULL else ""
         name = q if base == FULL and q else base + suffix
         if base == FULL:
-            arms.append((name, False, None, q))
+            arms.append((name, False, None, q, None))
         elif base == "snapkv":
-            arms.append((name, True, None, q))
+            arms.append((name, True, None, q, None))
+        elif base in PROBE_METHODS:
+            arms.append((name, True, None, q, base))
         elif base == "random-mid":
-            arms.append((name, True, dict(mode="random", ilf_layers=mid), q))
+            arms.append((name, True, dict(mode="random", ilf_layers=mid), q, None))
         elif base.startswith("ilf-"):
             layers = {"ilf-all": None, "ilf-mid": mid, "ilf-except-mid": allayers - mid,
                       "ilf-mid-band": mid}[base]
             extra = {"count_layers": "band"} if base == "ilf-mid-band" else {}
             for lam in lams:
-                arms.append((f"{name}@lam={lam:g}", True, dict(lam=lam, ilf_layers=layers, **extra), q))
+                arms.append((f"{name}@lam={lam:g}", True, dict(lam=lam, ilf_layers=layers, **extra), q, None))
         else:
             raise ValueError(f"unknown method {m!r}")
     return arms
@@ -304,17 +327,30 @@ def set_seq_len(model, n):
         layer.self_attn.kv_seq_len = n
 
 
-def compress(model, prefix_ids, capacity):
-    """Prefill the document and compress its cache. Returns (cache tuple, ms for prefill+compress)."""
+def compress(model, prefix_ids, capacity, probe_ids=None):
+    """Prefill the document and compress its cache to `capacity` document tokens.
+    probe_ids=None: plain SnapKV (its window = the document's last WINDOW tokens, kept).
+    probe_ids given: the probe is appended after the document and used as SnapKV's observation
+    window (window_size = probe length), so SnapKV keeps the `capacity` document tokens the probe
+    attends to most; the probe's own tokens are then removed from the cache.
+    Returns (cache tuple, ms for prefill + compression)."""
     import torch
-    model.config.max_capacity_prompt = capacity
+    if probe_ids is None or capacity >= len(prefix_ids):
+        ids, window, cap, drop = prefix_ids, WINDOW, capacity, 0
+    else:
+        ids, window, drop = prefix_ids + probe_ids, len(probe_ids), len(probe_ids)
+        cap = capacity + window  # SnapKV keeps (cap - window) document tokens + the probe
+    model.config.window_size, model.config.max_capacity_prompt = window, cap
     set_seq_len(model, 0)
-    ids = torch.tensor([prefix_ids], device=model.device)
+    x = torch.tensor([ids], device=model.device)
     torch.cuda.synchronize()
     t0 = time.perf_counter()
     with torch.no_grad():
-        pkv = model.model(ids, use_cache=True).past_key_values  # decoder only: no logits needed
+        pkv = model.model(x, use_cache=True).past_key_values  # decoder only: no logits needed
+        if drop:
+            pkv = tuple((k[:, :, :-drop].contiguous(), v[:, :, :-drop].contiguous()) for k, v in pkv)
     torch.cuda.synchronize()
+    model.config.window_size = WINDOW
     return pkv, 1000 * (time.perf_counter() - t0)
 
 
@@ -383,8 +419,13 @@ def cmd_run(args):
     out_dir.mkdir(parents=True, exist_ok=True)
     mid = parse_layers(args.mid)
     from snapkv.monkeypatch.quant import mem_fraction, parse_quant, quantize_cache
-    for label, evicts, ilf_kwargs, qspec in method_arms(args.methods, args.lams, mid):
+    probes = dict(PROBES, **({"probe-custom": args.probe_text} if args.probe_text else {}))
+    for label, evicts, ilf_kwargs, qspec, probe in method_arms(args.methods, args.lams, mid):
         bits = parse_quant(qspec, N_LAYERS, mid) if qspec else [16] * N_LAYERS
+        if probe == "probe-custom" and not args.probe_text:
+            raise SystemExit("probe-custom needs --probe_text")
+        static_probe = encode_probe(tok, probes[probe]) if probe in probes else None
+        per_question = probe == "probe-question"  # oracle: re-compress with each question as the probe
         for budget in (args.budgets if evicts else [FULL]):
             arm = f"{label}__b={budget_tag(budget)}__n={args.n_docs}__t={args.doc_tokens}__s={args.seed}"
             path = out_dir / f"{arm}.csv"
@@ -397,22 +438,31 @@ def cmd_run(args):
             torch.cuda.reset_peak_memory_stats()
             rows, t_arm = [], time.perf_counter()
             for d, (prefix, qs, first_q_noans) in enumerate(encoded):
-                pkv, prefill_ms = compress(model, prefix, capacity_for(budget, len(prefix)))
-                cache_len = pkv[0][0].shape[-2]
-                if qspec:  # simulated quantization: accuracy is exact, speed is not representative
-                    pkv = quantize_cache(pkv, bits)
-                    dec_ms = float("nan")
-                else:
+                cap = capacity_for(budget, len(prefix))
+
+                def build(probe_ids):
+                    pkv, ms = compress(model, prefix, cap, probe_ids)
+                    n = pkv[0][0].shape[-2]
+                    if qspec:  # simulated quantization: accuracy is exact, speed is not representative
+                        pkv = quantize_cache(pkv, bits)
+                    return pkv, ms, n
+
+                if not per_question:  # one compressed cache shared by every question
+                    pkv, prefill_ms, cache_len = build(static_probe)
                     dec_ms = (decode_ms_per_token(model, pkv, len(prefix), first_q_noans)
-                              if d < args.latency_docs else float("nan"))
+                              if d < args.latency_docs and not qspec else float("nan"))
                 for qi, (q, suffix, n_gold) in enumerate(qs):
+                    if per_question:
+                        pkv, prefill_ms, cache_len = build(encode_probe(tok, q["question"]))
+                        dec_ms = float("nan")
                     rows.append({"task": args.task, "method": label, "budget": budget_tag(budget), "doc": d,
                                  "question": qi, "depth": q["depth"], **score_question(model, pkv, len(prefix), suffix, n_gold),
                                  "prefix_tokens": len(prefix), "cache_tokens": cache_len,
                                  "kept_frac": cache_len / len(prefix),
                                  "mem_frac": cache_len / len(prefix) * mem_fraction(bits),
                                  "bits": qspec or "fp16", "prefill_ms": prefill_ms,
-                                 "decode_ms_per_token": dec_ms if qi == 0 else float("nan")})
+                                 "decode_ms_per_token": dec_ms if qi == 0 else float("nan"),
+                                 "probe": "(the question)" if per_question else probes.get(probe, "")})
                 del pkv
             detach_ilf(model)
             df = pd.DataFrame(rows)
@@ -459,6 +509,10 @@ def cmd_summarize(args):
             diff = (m.exact.astype(float) - m.exact_snap.astype(float)).groupby(m.doc).mean()
             dlo, dhi = bootstrap_ci(diff.values)
             row.update({"vs_snapkv": diff.mean(), "vs_snapkv_lo": dlo, "vs_snapkv_hi": dhi})
+            oracle = df[(df.method == "probe-question") & (df.budget == budget)]
+            gap = oracle.exact.mean() - base.exact.mean() if len(oracle) else float("nan")
+            if method.startswith("probe-") and method != "probe-question" and gap > 0:
+                row["gap_closed"] = (g.exact.mean() - base.exact.mean()) / gap  # share of SnapKV->oracle gap
         rows.append(row)
     summary = pd.DataFrame(rows).sort_values(["budget", "method"])
     path = Path(args.out) / f"summary_{args.task}.csv"
@@ -516,6 +570,18 @@ def cmd_selfcheck(args):
                   f"| mean nll {sum(r['nll'] for r in res) / len(res):.2f}")
             if spec_bits == 8:
                 assert [r["exact"] for r in res] == [r["exact"] for r in fp16], "int8 should match fp16"
+        probe = encode_probe(tok, PROBES["probe-details"])
+        cap = capacity_for(0.3, len(prefix))
+        snap, _ = compress(model, prefix, cap)
+        prb, _ = compress(model, prefix, cap, probe)
+        assert snap[0][0].shape[-2] == cap and prb[0][0].shape[-2] == cap, "probe tokens must be removed"
+        differ = not all(torch.equal(a[0], b[0]) for a, b in zip(snap, prb))
+        near, _ = compress(model, prefix, len(prefix) - 1, probe)
+        agree = [score_question(model, near, len(prefix), *encode_suffix(tok, q))["exact"] for q in questions]
+        print(f"  {task}: 30% budget keeps {cap} document tokens with SnapKV and with the probe (probe removed) "
+              f"| selections differ: {differ} | probe keeping all but 1 token: exact {sum(agree)}/{len(agree)} "
+              f"(full cache {sum(r['exact'] for r in fp16)}/{len(fp16)})")
+        assert differ, "the probe should change which tokens SnapKV keeps"
     print("SELFCHECK PASSED")
 
 
@@ -526,7 +592,9 @@ def main():
     r.add_argument("--task", choices=TASKS, required=True)
     r.add_argument("--methods", nargs="+", default=[FULL, "snapkv"],
                    help="full snapkv ilf-all ilf-mid ilf-except-mid ilf-mid-band random-mid | int8 int4 int2 "
-                        "mixed-A-B | eviction+quantization, e.g. snapkv+int2 ilf-mid+mixed-4-2")
+                        "mixed-A-B | eviction+quantization, e.g. snapkv+int2 ilf-mid+mixed-4-2 | "
+                        "probe-details probe-repeat probe-custom probe-question (e.g. probe-details+int2)")
+    r.add_argument("--probe_text", default=None, help="probe wording for --methods probe-custom")
     r.add_argument("--budgets", nargs="+", type=float, default=[0.2],
                    help="fraction of the document's tokens SnapKV keeps (window included)")
     r.add_argument("--lams", nargs="+", type=float, default=[1.0])
