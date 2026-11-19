@@ -488,8 +488,22 @@ def cmd_summarize(args):
     files = sorted((Path(args.out) / args.task).glob("*.csv"))
     if not files:
         raise SystemExit(f"no results in {Path(args.out) / args.task}")
-    df = pd.concat([pd.read_csv(f, dtype={"budget": str}) for f in files if "__n=3__" not in f.name or args.include_pilot],
-                   ignore_index=True)
+    parts = []
+    for f in files:
+        if "__n=3__" in f.name and not args.include_pilot:
+            continue
+        part = pd.read_csv(f, dtype={"budget": str})
+        t = re.search(r"__t=(\d+)__", f.name)
+        part["doc_tokens"] = int(t.group(1)) if t else -1
+        parts.append(part)
+    df = pd.concat(parts, ignore_index=True)
+    lengths = sorted(df.doc_tokens.unique())
+    if args.doc_tokens:
+        df = df[df.doc_tokens == args.doc_tokens]
+        if df.empty:
+            raise SystemExit(f"no results with --doc_tokens {args.doc_tokens} (found {lengths})")
+    elif len(lengths) > 1:
+        print(f"note: results for several document lengths {lengths} are pooled; pass --doc_tokens to pick one")
     if "mem_frac" not in df:
         df["mem_frac"] = df.kept_frac
     df["mem_frac"] = df.mem_frac.fillna(df.kept_frac)
@@ -513,6 +527,14 @@ def cmd_summarize(args):
             gap = oracle.exact.mean() - base.exact.mean() if len(oracle) else float("nan")
             if method.startswith("probe-") and method != "probe-question" and gap > 0:
                 row["gap_closed"] = (g.exact.mean() - base.exact.mean()) / gap  # share of SnapKV->oracle gap
+        # paired comparison with plain fp16 SnapKV at the SAME MEMORY (e.g. snapkv+int2 at 0.533 vs snapkv at 0.10)
+        same_mem = df[(df.method == "snapkv") & ((df.mem_frac - g.mem_frac.mean()).abs() < 0.003)]
+        if method != "snapkv" and len(same_mem):
+            m = g.merge(same_mem, on=["doc", "question"], suffixes=("", "_snap"))
+            if len(m):
+                diff = (m.exact.astype(float) - m.exact_snap.astype(float)).groupby(m.doc).mean()
+                dlo, dhi = bootstrap_ci(diff.values)
+                row.update({"vs_snapkv_same_mem": diff.mean(), "same_mem_lo": dlo, "same_mem_hi": dhi})
         rows.append(row)
     summary = pd.DataFrame(rows).sort_values(["budget", "method"])
     path = Path(args.out) / f"summary_{args.task}.csv"
@@ -520,8 +542,9 @@ def cmd_summarize(args):
     with pd.option_context("display.width", 200, "display.max_columns", 30):
         print(summary.round(3).to_string(index=False))
         print("\naccuracy vs cache memory (fraction of the fp16 full cache):")
-        print(summary.sort_values("mem_frac")[["method", "budget", "mem_frac", "exact", "exact_lo", "exact_hi",
-                                               "digit_acc", "nll"]].round(3).to_string(index=False))
+        cols = ["method", "budget", "mem_frac", "exact", "exact_lo", "exact_hi", "digit_acc", "nll"]
+        cols += [c for c in ("vs_snapkv_same_mem", "same_mem_lo", "same_mem_hi") if c in summary]
+        print(summary.sort_values(["mem_frac", "method"])[cols].round(3).to_string(index=False))
         df["depth_bin"] = pd.cut(df.depth, [0, 0.25, 0.5, 0.75, 1.0])
         print("\nexact match by fact depth:")
         print(df.pivot_table(index=["budget", "method"], columns="depth_bin", values="exact",
@@ -611,6 +634,7 @@ def main():
     s.add_argument("--task", choices=TASKS, required=True)
     s.add_argument("--out", default=DEFAULT_OUT)
     s.add_argument("--include_pilot", action="store_true", help="also include 3-document pilot files")
+    s.add_argument("--doc_tokens", type=int, default=None, help="only results for this document length (e.g. 32000)")
     sub.add_parser("selfcheck")
     args = p.parse_args()
     {"run": cmd_run, "summarize": cmd_summarize, "selfcheck": cmd_selfcheck}[args.cmd](args)
