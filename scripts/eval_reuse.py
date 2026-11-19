@@ -1,8 +1,12 @@
 """Reused-prefix evaluation for SnapKV and ILF on Mistral-7B-Instruct-v0.2.
 
 Every document is compressed ONCE, before any question is seen, and then every question is
-asked on that same compressed cache. Two tasks:
+asked on that same compressed cache. Tasks:
 
+  niah      Needle-in-a-Haystack in the style of the original test (gkamradt/LLMTest_NeedleInAHaystack):
+            the Paul Graham essays concatenated in file order, truncated to --doc_tokens, with 20
+            "secret code" needles spread evenly and snapped back to the preceding period, and the
+            original prompt wording. Documents differ by which essay they start from.
   haystack  natural prose (WikiText, digit-free) with 20 "secret code" sentences at evenly
             spaced depths; question: "What is the secret code of <name>?" (5-digit answer)
   ruler_mk  RULER-style multi-key needles: the whole haystack is made of needles
@@ -17,7 +21,7 @@ cache, followed by the gold digits, and we check the model's top prediction at e
 
 Commands (run with the Python 3.10 environment):
   python scripts/eval_reuse.py selfcheck
-  python scripts/eval_reuse.py run --task haystack --methods full snapkv --budgets 0.1 0.2 0.3 0.5 --n_docs 3
+  python scripts/eval_reuse.py run --task niah --methods full snapkv --budgets 0.1 0.2 0.3 0.5 --n_docs 3
   python scripts/eval_reuse.py run --task haystack --methods full snapkv ilf-all ilf-mid ilf-except-mid random-mid \
          --budgets 0.2 --lams 0.25 1
   python scripts/eval_reuse.py summarize --task haystack
@@ -38,6 +42,10 @@ N_LAYERS = 32
 WINDOW, KERNEL, POOLING = 32, 7, "maxpool"
 DEFAULT_OUT = "/content/drive/MyDrive/snapkv_ilf_results"
 FULL = "full"
+TASKS = ["niah", "haystack", "ruler_mk"]
+NIAH_REPO = "https://github.com/gkamradt/LLMTest_NeedleInAHaystack.git"
+DEFAULT_ESSAYS = "/content/LLMTest_NeedleInAHaystack/needlehaystack/PaulGrahamEssays"
+NIAH_INSTRUCTION = "Don't give information outside the document or repeat your findings"
 
 NAMES = ["Alice", "Bruno", "Chiara", "Dmitri", "Esme", "Farid", "Greta", "Hiro", "Ines", "Jonas",
          "Kemal", "Lena", "Mateo", "Nadia", "Oskar", "Priya", "Quentin", "Rosa", "Sven", "Tariq",
@@ -120,6 +128,55 @@ def make_haystack_doc(tok, paragraphs, doc_tokens, n_facts, seed):
     return intro + " ".join(sentences), questions
 
 
+def load_pg_essays(essays_dir=DEFAULT_ESSAYS):
+    """The Paul Graham essays shipped with the original Needle-in-a-Haystack repo, in file order.
+    Cloned automatically if `essays_dir` does not exist."""
+    import glob
+    import subprocess
+    if not os.path.isdir(essays_dir):
+        repo = essays_dir.split("/needlehaystack/")[0]
+        print(f"cloning {NIAH_REPO} -> {repo}")
+        subprocess.run(["git", "clone", "-q", "--depth", "1", NIAH_REPO, repo], check=True)
+    files = sorted(glob.glob(os.path.join(essays_dir, "*.txt")))
+    if not files:
+        raise FileNotFoundError(f"no .txt essays in {essays_dir}")
+    essays = []
+    for f in files:
+        with open(f, encoding="utf-8") as fh:
+            essays.append(fh.read())
+    return essays
+
+
+def make_niah_doc(tok, essays, doc_tokens, n_facts, seed):
+    """Original-style haystack: essays concatenated in order (starting at essay `seed`), cut to
+    `doc_tokens` tokens; needles at evenly spaced depths, each moved back to the preceding period."""
+    rng = random.Random(seed)
+    buf, n_tok, i = [], 0, seed % len(essays)
+    while n_tok < doc_tokens:
+        essay = essays[i % len(essays)]
+        buf.append(essay)
+        n_tok += len(tok(essay, add_special_tokens=False).input_ids)
+        i += 1
+    ids = tok("".join(buf), add_special_tokens=False).input_ids[:doc_tokens]
+    text = tok.decode(ids)
+    names = rng.sample(NAMES, n_facts)
+    codes = [str(rng.randint(10000, 99999)) for _ in names]
+    spots = []
+    for j in range(n_facts):
+        idx = int((j + 0.5) / n_facts * len(text))
+        period = text.rfind(".", max(0, idx - 1000), idx)  # snap back to the preceding period
+        spots.append(period + 1 if period >= 0 else idx)
+    n_chars = len(text)  # depths are reported against the haystack before insertion
+    for j in reversed(range(n_facts)):  # insert from the end so earlier positions stay valid
+        s = spots[j]
+        text = text[:s] + f" The secret code of {names[j]} is {codes[j]}." + text[s:]
+    questions = [{"key": nm, "value": cd, "depth": s / n_chars,
+                  "question": f"What is the secret code of {nm}? {NIAH_INSTRUCTION}",
+                  "answer_prefix": f"The secret code of {nm} is"}
+                 for nm, cd, s in zip(names, codes, spots)]
+    return text, questions
+
+
 def make_ruler_mk_doc(tok, doc_tokens, n_queries, seed):
     rng = random.Random(seed)
     keys = [f"{a}-{b}" for a in ADJECTIVES for b in NOUNS]
@@ -139,7 +196,10 @@ def make_ruler_mk_doc(tok, doc_tokens, n_queries, seed):
     return intro + body, questions
 
 
-def build_docs(tok, task, n_docs, doc_tokens, n_questions, seed=0):
+def build_docs(tok, task, n_docs, doc_tokens, n_questions, seed=0, essays_dir=DEFAULT_ESSAYS):
+    if task == "niah":
+        essays = load_pg_essays(essays_dir)
+        return [make_niah_doc(tok, essays, doc_tokens, n_questions, seed + d) for d in range(n_docs)]
     if task == "haystack":
         paragraphs = load_prose_paragraphs()
         return [make_haystack_doc(tok, paragraphs, doc_tokens, n_questions, seed + d) for d in range(n_docs)]
@@ -292,7 +352,7 @@ def cmd_run(args):
     from snapkv.monkeypatch.ilf import attach_ilf, detach_ilf
 
     model, tok = load_model()
-    docs = build_docs(tok, args.task, args.n_docs, args.doc_tokens, args.n_questions, args.seed)
+    docs = build_docs(tok, args.task, args.n_docs, args.doc_tokens, args.n_questions, args.seed, args.essays_dir)
     encoded = []
     for body, questions in docs:
         prefix = encode_prefix(tok, body)
@@ -389,7 +449,7 @@ def cmd_selfcheck(args):
     3. both tasks tokenize every digit as its own token."""
     import torch
     model, tok = load_model()
-    for task in ("haystack", "ruler_mk"):
+    for task in TASKS:
         body, questions = build_docs(tok, task, 1, 2000, 4, seed=123)[0]
         prefix = encode_prefix(tok, body)
         pkv, _ = compress(model, prefix, capacity_for(FULL, len(prefix)))
@@ -420,7 +480,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("run")
-    r.add_argument("--task", choices=["haystack", "ruler_mk"], required=True)
+    r.add_argument("--task", choices=TASKS, required=True)
     r.add_argument("--methods", nargs="+", default=[FULL, "snapkv"],
                    help="full snapkv ilf-all ilf-mid ilf-except-mid ilf-mid-band random-mid")
     r.add_argument("--budgets", nargs="+", type=float, default=[0.2],
@@ -432,10 +492,11 @@ def main():
     r.add_argument("--doc_tokens", type=int, default=8000)
     r.add_argument("--latency_docs", type=int, default=5, help="documents on which decode speed is timed")
     r.add_argument("--seed", type=int, default=0)
+    r.add_argument("--essays_dir", default=DEFAULT_ESSAYS, help="Paul Graham essays for --task niah")
     r.add_argument("--out", default=DEFAULT_OUT)
     r.add_argument("--overwrite", action="store_true")
     s = sub.add_parser("summarize")
-    s.add_argument("--task", choices=["haystack", "ruler_mk"], required=True)
+    s.add_argument("--task", choices=TASKS, required=True)
     s.add_argument("--out", default=DEFAULT_OUT)
     sub.add_parser("selfcheck")
     args = p.parse_args()
