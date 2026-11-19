@@ -24,7 +24,13 @@ Commands (run with the Python 3.10 environment):
   python scripts/eval_reuse.py run --task niah --methods full snapkv --budgets 0.1 0.2 0.3 0.5 --n_docs 3
   python scripts/eval_reuse.py run --task haystack --methods full snapkv ilf-all ilf-mid ilf-except-mid random-mid \
          --budgets 0.2 --lams 0.25 1
+  python scripts/eval_reuse.py run --task niah --methods int8 int4 int2 mixed-4-2 snapkv+int2 --budgets 0.5
   python scripts/eval_reuse.py summarize --task haystack
+
+Quantization (int8 / int4 / int2 / mixed-A-B, alone or after eviction as "snapkv+int2") is simulated:
+each layer's cache is quantized and dequantized right after compression (snapkv/monkeypatch/quant.py),
+so accuracy is exact while `mem_frac` (cache memory as a fraction of fp16) is computed analytically,
+and decode speed is not measured for those arms.
 
 Each (method, budget) arm is saved to <out>/<task>/<arm>.csv as soon as it finishes; arms that
 already have a file are skipped, so a disconnected Colab run can simply be started again.
@@ -235,20 +241,32 @@ def parse_layers(spec):
 
 
 def method_arms(methods, lams, mid):
-    """[(label, attach_ilf kwargs or None)]. None = plain SnapKV (or the full cache)."""
+    """[(label, evicts, attach_ilf kwargs or None, quantization spec or None)].
+
+    A method is an eviction rule, a quantization, or both joined by '+':
+      full | snapkv | ilf-all | ilf-mid | ilf-except-mid | ilf-mid-band | random-mid
+      int8 | int4 | int2 | mixed-A-B   (A bits in the --mid layers, B elsewhere; full cache)
+      snapkv+int2, ilf-mid+mixed-4-2, ...   (evict to the budget, then quantize what is kept)
+    """
+    from snapkv.monkeypatch.quant import is_quant_spec
     allayers = set(range(N_LAYERS))
     arms = []
     for m in methods:
-        if m in (FULL, "snapkv"):
-            arms.append((m, None))
-        elif m == "random-mid":
-            arms.append((m, dict(mode="random", ilf_layers=mid)))
-        elif m.startswith("ilf-"):
+        base, q = (m.split("+", 1) if "+" in m else ((FULL, m) if is_quant_spec(m) else (m, None)))
+        suffix = f"+{q}" if q and base != FULL else ""
+        name = q if base == FULL and q else base + suffix
+        if base == FULL:
+            arms.append((name, False, None, q))
+        elif base == "snapkv":
+            arms.append((name, True, None, q))
+        elif base == "random-mid":
+            arms.append((name, True, dict(mode="random", ilf_layers=mid), q))
+        elif base.startswith("ilf-"):
             layers = {"ilf-all": None, "ilf-mid": mid, "ilf-except-mid": allayers - mid,
-                      "ilf-mid-band": mid}[m]
-            extra = {"count_layers": "band"} if m == "ilf-mid-band" else {}
+                      "ilf-mid-band": mid}[base]
+            extra = {"count_layers": "band"} if base == "ilf-mid-band" else {}
             for lam in lams:
-                arms.append((f"{m}@lam={lam:g}", dict(lam=lam, ilf_layers=layers, **extra)))
+                arms.append((f"{name}@lam={lam:g}", True, dict(lam=lam, ilf_layers=layers, **extra), q))
         else:
             raise ValueError(f"unknown method {m!r}")
     return arms
@@ -364,8 +382,10 @@ def cmd_run(args):
     out_dir = Path(args.out) / args.task
     out_dir.mkdir(parents=True, exist_ok=True)
     mid = parse_layers(args.mid)
-    for label, ilf_kwargs in method_arms(args.methods, args.lams, mid):
-        for budget in ([FULL] if label == FULL else args.budgets):
+    from snapkv.monkeypatch.quant import mem_fraction, parse_quant, quantize_cache
+    for label, evicts, ilf_kwargs, qspec in method_arms(args.methods, args.lams, mid):
+        bits = parse_quant(qspec, N_LAYERS, mid) if qspec else [16] * N_LAYERS
+        for budget in (args.budgets if evicts else [FULL]):
             arm = f"{label}__b={budget_tag(budget)}__n={args.n_docs}__t={args.doc_tokens}__s={args.seed}"
             path = out_dir / f"{arm}.csv"
             if path.exists() and not args.overwrite:
@@ -379,13 +399,19 @@ def cmd_run(args):
             for d, (prefix, qs, first_q_noans) in enumerate(encoded):
                 pkv, prefill_ms = compress(model, prefix, capacity_for(budget, len(prefix)))
                 cache_len = pkv[0][0].shape[-2]
-                dec_ms = (decode_ms_per_token(model, pkv, len(prefix), first_q_noans)
-                          if d < args.latency_docs else float("nan"))
+                if qspec:  # simulated quantization: accuracy is exact, speed is not representative
+                    pkv = quantize_cache(pkv, bits)
+                    dec_ms = float("nan")
+                else:
+                    dec_ms = (decode_ms_per_token(model, pkv, len(prefix), first_q_noans)
+                              if d < args.latency_docs else float("nan"))
                 for qi, (q, suffix, n_gold) in enumerate(qs):
                     rows.append({"task": args.task, "method": label, "budget": budget_tag(budget), "doc": d,
                                  "question": qi, "depth": q["depth"], **score_question(model, pkv, len(prefix), suffix, n_gold),
                                  "prefix_tokens": len(prefix), "cache_tokens": cache_len,
-                                 "kept_frac": cache_len / len(prefix), "prefill_ms": prefill_ms,
+                                 "kept_frac": cache_len / len(prefix),
+                                 "mem_frac": cache_len / len(prefix) * mem_fraction(bits),
+                                 "bits": qspec or "fp16", "prefill_ms": prefill_ms,
                                  "decode_ms_per_token": dec_ms if qi == 0 else float("nan")})
                 del pkv
             detach_ilf(model)
@@ -395,7 +421,7 @@ def cmd_run(args):
             df.to_csv(tmp, index=False)
             os.replace(tmp, path)
             print(f"[done] {arm}: exact {df.exact.mean():.3f}  digit {df.digit_acc.mean():.3f}  "
-                  f"nll {df.nll.mean():.2f}  kept {df.kept_frac.mean():.2f}  "
+                  f"nll {df.nll.mean():.2f}  kept {df.kept_frac.mean():.2f}  mem {df.mem_frac.mean():.3f}  "
                   f"({time.perf_counter() - t_arm:.0f}s)")
 
 
@@ -412,7 +438,11 @@ def cmd_summarize(args):
     files = sorted((Path(args.out) / args.task).glob("*.csv"))
     if not files:
         raise SystemExit(f"no results in {Path(args.out) / args.task}")
-    df = pd.concat([pd.read_csv(f, dtype={"budget": str}) for f in files], ignore_index=True)
+    df = pd.concat([pd.read_csv(f, dtype={"budget": str}) for f in files if "__n=3__" not in f.name or args.include_pilot],
+                   ignore_index=True)
+    if "mem_frac" not in df:
+        df["mem_frac"] = df.kept_frac
+    df["mem_frac"] = df.mem_frac.fillna(df.kept_frac)
     rows = []
     for (method, budget), g in df.groupby(["method", "budget"], sort=False):
         per_doc = g.groupby("doc").exact.mean()
@@ -420,6 +450,7 @@ def cmd_summarize(args):
         row = {"method": method, "budget": budget, "n_questions": len(g),
                "exact": g.exact.mean(), "exact_lo": lo, "exact_hi": hi,
                "digit_acc": g.digit_acc.mean(), "nll": g.nll.mean(), "kept_frac": g.kept_frac.mean(),
+               "mem_frac": g.mem_frac.mean(),
                "prefill_ms": g.drop_duplicates("doc").prefill_ms.median(),
                "decode_ms_per_token": g.decode_ms_per_token.median(), "peak_mem_GiB": g.peak_mem_GiB.max()}
         base = df[(df.method == "snapkv") & (df.budget == budget)]
@@ -434,6 +465,9 @@ def cmd_summarize(args):
     summary.to_csv(path, index=False)
     with pd.option_context("display.width", 200, "display.max_columns", 30):
         print(summary.round(3).to_string(index=False))
+        print("\naccuracy vs cache memory (fraction of the fp16 full cache):")
+        print(summary.sort_values("mem_frac")[["method", "budget", "mem_frac", "exact", "exact_lo", "exact_hi",
+                                               "digit_acc", "nll"]].round(3).to_string(index=False))
         df["depth_bin"] = pd.cut(df.depth, [0, 0.25, 0.5, 0.75, 1.0])
         print("\nexact match by fact depth:")
         print(df.pivot_table(index=["budget", "method"], columns="depth_bin", values="exact",
@@ -473,6 +507,15 @@ def cmd_selfcheck(args):
         print(f"{task}: prefix {len(prefix)} tokens | one-pass vs reused argmax agree {agree}/{len(questions)} "
               f"| max logit diff {max_diff:.3f} | cache unchanged after scoring: {unchanged}")
         assert agree == len(questions) and unchanged, "reuse harness does not match a plain forward pass"
+        from snapkv.monkeypatch.quant import quantize_cache
+        fp16 = [score_question(model, pkv, len(prefix), *encode_suffix(tok, q)) for q in questions]
+        for spec_bits in (8, 4, 2):
+            qkv = quantize_cache(pkv, [spec_bits] * len(pkv))
+            res = [score_question(model, qkv, len(prefix), *encode_suffix(tok, q)) for q in questions]
+            print(f"  {task}: int{spec_bits} full cache | exact {sum(r['exact'] for r in res)}/{len(res)} "
+                  f"| mean nll {sum(r['nll'] for r in res) / len(res):.2f}")
+            if spec_bits == 8:
+                assert [r["exact"] for r in res] == [r["exact"] for r in fp16], "int8 should match fp16"
     print("SELFCHECK PASSED")
 
 
@@ -482,7 +525,8 @@ def main():
     r = sub.add_parser("run")
     r.add_argument("--task", choices=TASKS, required=True)
     r.add_argument("--methods", nargs="+", default=[FULL, "snapkv"],
-                   help="full snapkv ilf-all ilf-mid ilf-except-mid ilf-mid-band random-mid")
+                   help="full snapkv ilf-all ilf-mid ilf-except-mid ilf-mid-band random-mid | int8 int4 int2 "
+                        "mixed-A-B | eviction+quantization, e.g. snapkv+int2 ilf-mid+mixed-4-2")
     r.add_argument("--budgets", nargs="+", type=float, default=[0.2],
                    help="fraction of the document's tokens SnapKV keeps (window included)")
     r.add_argument("--lams", nargs="+", type=float, default=[1.0])
@@ -498,6 +542,7 @@ def main():
     s = sub.add_parser("summarize")
     s.add_argument("--task", choices=TASKS, required=True)
     s.add_argument("--out", default=DEFAULT_OUT)
+    s.add_argument("--include_pilot", action="store_true", help="also include 3-document pilot files")
     sub.add_parser("selfcheck")
     args = p.parse_args()
     {"run": cmd_run, "summarize": cmd_summarize, "selfcheck": cmd_selfcheck}[args.cmd](args)
