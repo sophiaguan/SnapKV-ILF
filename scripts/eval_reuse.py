@@ -421,7 +421,7 @@ def cmd_run(args):
     from snapkv.monkeypatch.quant import mem_fraction, parse_quant, quantize_cache
     probes = dict(PROBES, **({"probe-custom": args.probe_text} if args.probe_text else {}))
     for label, evicts, ilf_kwargs, qspec, probe in method_arms(args.methods, args.lams, mid):
-        bits = parse_quant(qspec, N_LAYERS, mid) if qspec else [16] * N_LAYERS
+        bits = parse_quant(qspec, N_LAYERS, mid, args.calib_dir) if qspec else [16] * N_LAYERS
         if probe == "probe-custom" and not args.probe_text:
             raise SystemExit("probe-custom needs --probe_text")
         static_probe = encode_probe(tok, probes[probe]) if probe in probes else None
@@ -475,6 +475,157 @@ def cmd_run(args):
                   f"({time.perf_counter() - t_arm:.0f}s)")
 
 
+def cmd_calibrate(args):
+    """Find which layers' keys / values most need extra precision, then choose how many to upgrade
+    at a fixed memory budget. Uses held-out calibration documents (default --seed 100).
+
+    1. Sensitivity: start from --base_bits everywhere; for each of the 2 x n_layers slots
+       (layer l keys, layer l values) change only that slot to --hi_bits and record the change in
+       NLL of the gold digits, averaged over the calibration questions.
+         --base_bits 2 --hi_bits 4  raise slots from 2 to 4 bits (most helpful first)
+         --base_bits 4 --hi_bits 2  lower slots from 4 to 2 bits (least harmful first), freeing memory
+    2. Allocation: change the k best-ranked slots for each k in --ks. Each config costs a different amount
+       of memory per token, so at --target_mem it keeps a different number of tokens; score each on
+       the calibration questions and keep the k with the lowest NLL.
+    3. Save every config to <calib_dir>/<name>_k<k>.json and the chosen one to <calib_dir>/<name>.json,
+       usable as  --methods <method>+cal=<name>  with the printed --budgets value.
+
+    SnapKV keeps tokens in descending score order, so a smaller budget keeps a prefix of a larger
+    budget's tokens: each calibration question is compressed once, at the largest token count."""
+    import json
+    import torch
+    from snapkv.monkeypatch.quant import fake_quant, mem_fraction
+
+    model, tok = load_model()
+    n_layers = model.config.num_hidden_layers
+    base, hi = args.base_bits, args.hi_bits
+    docs = build_docs(tok, args.task, args.n_docs, args.doc_tokens, args.n_questions, args.seed, args.essays_dir)
+    probes = dict(PROBES)
+    if args.method not in ("snapkv", "probe-question", *probes):
+        raise SystemExit(f"--method must be snapkv, probe-question or one of {list(probes)}")
+    keeps_window = args.method == "snapkv"  # plain SnapKV keeps its last WINDOW tokens at the end
+
+    slots = [(l, kv) for l in range(n_layers) for kv in ("k", "v")]
+
+    def config(upgraded):
+        up = set(upgraded)
+        return [(hi if (l, "k") in up else base, hi if (l, "v") in up else base) for l in range(n_layers)]
+
+    def take(pkv, n):
+        """The cache SnapKV would keep with n tokens, from a cache compressed with more tokens."""
+        if keeps_window:
+            return tuple((torch.cat([k[:, :, :n - WINDOW], k[:, :, -WINDOW:]], 2),
+                          torch.cat([v[:, :, :n - WINDOW], v[:, :, -WINDOW:]], 2)) for k, v in pkv)
+        return tuple((k[:, :, :n], v[:, :, :n]) for k, v in pkv)
+
+    # compress once at the largest token count any config can keep (all slots at the lower width);
+    # sensitivity is measured at the token count of the starting config (all slots at base_bits)
+    max_budget = args.target_mem / mem_fraction([min(base, hi)] * n_layers)
+    base_budget = args.target_mem / mem_fraction([base] * n_layers)
+    encoded = [(encode_prefix(tok, body), questions) for body, questions in docs]
+
+    def calibration_items():
+        """Yield (prefix, suffix, n_gold, fp16 cache compressed at max_budget), one question at a time,
+        so only one compressed cache is in memory (each pass recompresses)."""
+        for prefix, questions in encoded:
+            shared = None
+            for q in questions:
+                suffix, n_gold = encode_suffix(tok, q)
+                cap = capacity_for(max_budget, len(prefix))
+                if args.method == "probe-question":
+                    pkv, _ = compress(model, prefix, cap, encode_probe(tok, q["question"]))
+                else:
+                    if shared is None:
+                        probe_ids = encode_probe(tok, probes[args.method]) if args.method in probes else None
+                        shared, _ = compress(model, prefix, cap, probe_ids)
+                    pkv = shared
+                yield prefix, q, suffix, n_gold, pkv
+                del pkv
+            del shared
+
+    # 1. sensitivity of each slot at the largest token count
+    t0 = time.perf_counter()
+    gain = {s: 0.0 for s in slots}
+    gain_exact = {s: 0.0 for s in slots}
+    base_nll = base_exact = 0.0
+    n = 0
+    for prefix, q, suffix, n_gold, pkv in calibration_items():
+        if n == 0:  # sanity check: slicing a larger compression == compressing at the smaller budget
+            small = capacity_for(max_budget / 2, len(prefix))
+            probe_ids = (encode_probe(tok, q["question"]) if args.method == "probe-question"
+                         else encode_probe(tok, probes[args.method]) if args.method in probes else None)
+            direct, _ = compress(model, prefix, small, probe_ids)
+            same = all(torch.equal(a[0], b[0]) for a, b in zip(direct, take(pkv, small)))
+            print(f"slicing check (direct compression at half the budget == slice of the larger one): {same}")
+            del direct
+        at_base = take(pkv, capacity_for(base_budget, len(prefix)))
+        qb = [(fake_quant(k, base, dim=2), fake_quant(v, base, dim=3)) for k, v in at_base]
+        qh = [(fake_quant(k, hi, dim=2), fake_quant(v, hi, dim=3)) for k, v in at_base]
+        del at_base
+        r0 = score_question(model, tuple(qb), len(prefix), suffix, n_gold)
+        base_nll += r0["nll"]
+        base_exact += r0["exact"]
+        for l, kv in slots:
+            layer = (qh[l][0], qb[l][1]) if kv == "k" else (qb[l][0], qh[l][1])
+            r = score_question(model, tuple(qb[:l] + [layer] + qb[l + 1:]), len(prefix), suffix, n_gold)
+            gain[(l, kv)] += r0["nll"] - r["nll"]
+            gain_exact[(l, kv)] += r["exact"] - r0["exact"]
+        del qb, qh
+        n += 1
+    ranked = sorted(slots, key=lambda s: -gain[s])
+    print(f"\nsensitivity on {n} calibration questions ({args.task}, {args.doc_tokens} tokens, seed {args.seed}; "
+          f"{time.perf_counter() - t0:.0f}s): all-{base}-bit NLL {base_nll / n:.3f}, exact {base_exact / n:.3f}")
+    print(f"NLL gain from changing ONE slot from {base} to {hi} bits, best first (top 16; "
+          f"negative = that change hurts, so the least negative are the safest to lower):")
+    for l, kv in ranked[:16]:
+        print(f"  layer {l:2d} {'keys  ' if kv == 'k' else 'values'}  gain {gain[(l, kv)] / n:+.3f}  "
+              f"exact {gain_exact[(l, kv)] / n:+.3f}")
+    by_layer = " ".join(f"{l}:{(gain[(l, 'k')] + gain[(l, 'v')]) / n:+.2f}" for l in range(n_layers))
+    print(f"  per layer (keys + values): {by_layer}")
+
+    # 2. allocation: upgrade the top-k slots, at equal memory (second pass, recompressing)
+    t0 = time.perf_counter()
+    configs = [(k, config(ranked[:k])) for k in args.ks if k <= len(slots)]
+    acc = {k: [0.0, 0.0] for k, _ in configs}
+    for prefix, q, suffix, n_gold, pkv in calibration_items():
+        for k, cfg in configs:
+            budget = args.target_mem / mem_fraction(cfg)
+            qkv = tuple((fake_quant(a, kb, dim=2), fake_quant(b, vb, dim=3))
+                        for (a, b), (kb, vb) in zip(take(pkv, capacity_for(budget, len(prefix))), cfg))
+            r = score_question(model, qkv, len(prefix), suffix, n_gold)
+            acc[k][0] += r["nll"]
+            acc[k][1] += r["exact"]
+            del qkv
+    results = []
+    print(f"\nallocation at {args.target_mem:.4f} of fp16 memory ({time.perf_counter() - t0:.0f}s):")
+    for k, cfg in configs:
+        budget = args.target_mem / mem_fraction(cfg)
+        results.append({"k": k, "budget": budget, "mem_per_token": mem_fraction(cfg),
+                        "nll": acc[k][0] / n, "exact": acc[k][1] / n,
+                        "upgraded": [f"{l}{kv}" for l, kv in ranked[:k]],
+                        "k_bits": [c[0] for c in cfg], "v_bits": [c[1] for c in cfg]})
+        print(f"  {k:2d} slots changed to {hi} bits: keeps {budget:.4f} of tokens | calib NLL {acc[k][0] / n:.3f} "
+              f"exact {acc[k][1] / n:.3f}")
+    best = min(results, key=lambda r: r["nll"])
+
+    out = Path(args.calib_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    meta = {"task": args.task, "doc_tokens": args.doc_tokens, "seed": args.seed, "n_docs": args.n_docs,
+            "n_questions": args.n_questions, "method": args.method, "target_mem": args.target_mem,
+            "base_bits": base, "hi_bits": hi,
+            "sensitivity": {f"{l}{kv}": gain[(l, kv)] / n for l, kv in slots}}
+    for r in results:
+        with open(out / f"{args.name}_k{r['k']}.json", "w") as f:
+            json.dump({**meta, **r}, f, indent=1)
+    with open(out / f"{args.name}.json", "w") as f:
+        json.dump({**meta, **best, "all_k": [{x: r[x] for x in ("k", "budget", "nll", "exact")} for r in results]},
+                  f, indent=1)
+    print(f"\nchosen: {best['k']} slots changed to {hi} bits (calib NLL {best['nll']:.3f}, exact {best['exact']:.3f}) -> "
+          f"{out / (args.name + '.json')}")
+    print(f"evaluate on your test documents with:\n  run --task {args.task} --doc_tokens {args.doc_tokens} "
+          f"--methods {args.method}+cal={args.name} --budgets {best['budget']:.4f}")
+
+
 def bootstrap_ci(per_doc, n=2000, seed=0):
     import numpy as np
     rng = np.random.default_rng(seed)
@@ -517,8 +668,8 @@ def cmd_summarize(args):
                "mem_frac": g.mem_frac.mean(),
                "prefill_ms": g.drop_duplicates("doc").prefill_ms.median(),
                "decode_ms_per_token": g.decode_ms_per_token.median(), "peak_mem_GiB": g.peak_mem_GiB.max()}
-        base = df[(df.method == "snapkv") & (df.budget == budget)]
-        if method != "snapkv" and len(base):
+        base = df[(df.method == args.baseline) & (df.budget == budget)]
+        if method != args.baseline and len(base):
             m = g.merge(base, on=["doc", "question"], suffixes=("", "_snap"))
             diff = (m.exact.astype(float) - m.exact_snap.astype(float)).groupby(m.doc).mean()
             dlo, dhi = bootstrap_ci(diff.values)
@@ -528,8 +679,8 @@ def cmd_summarize(args):
             if method.startswith("probe-") and method != "probe-question" and gap > 0:
                 row["gap_closed"] = (g.exact.mean() - base.exact.mean()) / gap  # share of SnapKV->oracle gap
         # paired comparison with plain fp16 SnapKV at the SAME MEMORY (e.g. snapkv+int2 at 0.533 vs snapkv at 0.10)
-        same_mem = df[(df.method == "snapkv") & ((df.mem_frac - g.mem_frac.mean()).abs() < 0.003)]
-        if method != "snapkv" and len(same_mem):
+        same_mem = df[(df.method == args.baseline) & ((df.mem_frac - g.mem_frac.mean()).abs() < 0.003)]
+        if method != args.baseline and len(same_mem):
             m = g.merge(same_mem, on=["doc", "question"], suffixes=("", "_snap"))
             if len(m):
                 diff = (m.exact.astype(float) - m.exact_snap.astype(float)).groupby(m.doc).mean()
@@ -630,14 +781,37 @@ def main():
     r.add_argument("--essays_dir", default=DEFAULT_ESSAYS, help="Paul Graham essays for --task niah")
     r.add_argument("--out", default=DEFAULT_OUT)
     r.add_argument("--overwrite", action="store_true")
+    r.add_argument("--calib_dir", default=DEFAULT_OUT + "/calib", help="where cal=NAME configurations live")
+    c = sub.add_parser("calibrate", help="find which layers' keys/values need extra precision")
+    c.add_argument("--task", choices=TASKS, default="niah")
+    c.add_argument("--method", default="probe-question",
+                   help="selection the calibration uses: probe-question (question visible), snapkv, probe-*")
+    c.add_argument("--target_mem", type=float, default=0.0317,
+                   help="memory budget as a fraction of the fp16 full cache (0.0317 = 1,024 fp16 tokens at 32k)")
+    c.add_argument("--base_bits", type=int, default=2)
+    c.add_argument("--hi_bits", type=int, default=4)
+    c.add_argument("--ks", nargs="+", type=int, default=[0, 2, 4, 6, 8, 12, 16, 22, 32, 48, 64],
+                   help="numbers of upgraded slots to try")
+    c.add_argument("--n_docs", type=int, default=2)
+    c.add_argument("--n_questions", type=int, default=10)
+    c.add_argument("--doc_tokens", type=int, default=32000)
+    c.add_argument("--seed", type=int, default=100, help="calibration documents; keep different from test seeds")
+    c.add_argument("--essays_dir", default=DEFAULT_ESSAYS)
+    c.add_argument("--calib_dir", default=DEFAULT_OUT + "/calib")
+    c.add_argument("--name", default=None, help="config name (default <task>_t<doc_tokens>)")
     s = sub.add_parser("summarize")
     s.add_argument("--task", choices=TASKS, required=True)
     s.add_argument("--out", default=DEFAULT_OUT)
     s.add_argument("--include_pilot", action="store_true", help="also include 3-document pilot files")
     s.add_argument("--doc_tokens", type=int, default=None, help="only results for this document length (e.g. 32000)")
+    s.add_argument("--baseline", default="snapkv",
+                   help="method the vs_* columns compare against (e.g. probe-question for question-aware SnapKV)")
     sub.add_parser("selfcheck")
     args = p.parse_args()
-    {"run": cmd_run, "summarize": cmd_summarize, "selfcheck": cmd_selfcheck}[args.cmd](args)
+    if args.cmd == "calibrate" and not args.name:
+        args.name = f"{args.task}_t{args.doc_tokens}"
+    {"run": cmd_run, "summarize": cmd_summarize, "selfcheck": cmd_selfcheck,
+     "calibrate": cmd_calibrate}[args.cmd](args)
 
 
 if __name__ == "__main__":
